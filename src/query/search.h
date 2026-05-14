@@ -180,6 +180,11 @@ struct SearchParameters {
   bool inorder{false};
   std::optional<uint32_t> slop;
   bool verbatim{false};
+  // TODO: Scorer is currently a placeholder. The selected scoring function is
+  // not yet invoked; non-vector queries will report a score of 0.0.
+  // TODO: Validate the scorer value during parsing and reject invalid/unknown
+  // scorer names with an appropriate error.
+  std::string scorer{"BM25STD"};
   coordinator::IndexFingerprintVersion index_fingerprint_version;
   uint64_t slot_fingerprint;
   SearchResult search_result;
