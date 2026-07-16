@@ -105,7 +105,6 @@ class PredicateEvaluator : public query::Evaluator {
     auto it = records_.find(vmsdk::ToStringView(identifier.get()));
     if (it == records_.end()) {
       return EvaluationResult(false);
-      ;
     }
     auto index = predicate.GetIndex();
     // Parsing RECORD DATA: Field value from database key for post-query
@@ -115,9 +114,11 @@ class PredicateEvaluator : public query::Evaluator {
         vmsdk::ToStringView(it->second.value.get()), index->GetSeparator());
     if (!tags.ok()) {
       return EvaluationResult(false);
-      ;
     }
-    return predicate.Evaluate(&tags.value(), index->IsCaseSensitive());
+    EvaluationResult result =
+        predicate.Evaluate(&tags.value(), index->IsCaseSensitive());
+    ApplyLeafScore(result, predicate);
+    return result;
   }
 
   EvaluationResult EvaluateNumeric(
@@ -132,7 +133,9 @@ class PredicateEvaluator : public query::Evaluator {
     if (!out_numeric.ok()) {
       return EvaluationResult(false);
     }
-    return predicate.Evaluate(&out_numeric.value());
+    EvaluationResult result = predicate.Evaluate(&out_numeric.value());
+    ApplyLeafScore(result, predicate);
+    return result;
   }
 
   EvaluationResult EvaluateText(const query::TextPredicate &predicate,
@@ -141,10 +144,39 @@ class PredicateEvaluator : public query::Evaluator {
     if (!text_index_) {
       return EvaluationResult(false);
     }
-    return predicate.Evaluate(*text_index_, target_key_, require_positions);
+    EvaluationResult result =
+        predicate.Evaluate(*text_index_, target_key_, require_positions);
+    if (result.matches) {
+      // The matched leaf's raw relevance is the matched iterator's score,
+      // scaled by the predicate weight. `TextIterator::GetScore()` is supplied
+      // by the in-iterator-wiring API (leaf iterators compute it via the active
+      // scoring algorithm; composites aggregate their children).
+      //
+      // The null-guard is NOT merely defensive: filter_iterator is only
+      // populated on the proximity/slop/inorder path (require_positions ==
+      // true). A plain term match early-returns EvaluationResult(true) with a
+      // null iterator (see TermPredicate::Evaluate), so it still falls back to
+      // 1.0f neutral relevance here. Real relevance for the non-proximity path
+      // depends on that iterator also being populated.
+      result.score =
+          (result.filter_iterator ? result.filter_iterator->GetScore() : 1.0f) *
+          predicate.GetWeight();
+    }
+    return result;
   }
 
  private:
+  // A matched non-text leaf (numeric / tag) contributes `1.0 * weight`, which
+  // mirrors ComputeMatchedPredicateScore's leaf semantics. Keeping the two
+  // scorers aligned ensures a document revalidated through the predicate-tree
+  // walk (this path) ranks identically to one scored by the initial flat pass.
+  static void ApplyLeafScore(EvaluationResult &result,
+                             const query::Predicate &predicate) {
+    if (result.matches) {
+      result.score = predicate.GetWeight();
+    }
+  }
+
   const RecordsMap &records_;
   const valkey_search::indexes::text::TextIndex *text_index_ = nullptr;
   InternedStringPtr target_key_;
@@ -152,16 +184,26 @@ class PredicateEvaluator : public query::Evaluator {
 
 DEV_INTEGER_COUNTER(query, predicate_revalidation);
 
-bool VerifyFilter(const query::SearchParameters &parameters,
-                  const RecordsMap &records, const indexes::Neighbor &n) {
+// Result of a filter revalidation. `matches` has exactly the same semantics as
+// the previous `bool` return. `recomputed_score` is populated only when the
+// predicate-tree walk actually ran (i.e. a sequence mutation was detected);
+// it is std::nullopt on every early-return path.
+struct FilterVerification {
+  bool matches;
+  std::optional<float> recomputed_score;
+};
+
+FilterVerification VerifyFilter(const query::SearchParameters &parameters,
+                                const RecordsMap &records,
+                                const indexes::Neighbor &n) {
   auto predicate = parameters.filter_parse_results.root_predicate.get();
   if (predicate == nullptr) {
-    return true;
+    return {true, std::nullopt};
   }
   auto db_seq =
       parameters.index_schema->GetDbMutationSequenceNumber(n.external_id);
   if (db_seq == n.sequence_number) {
-    return true;
+    return {true, std::nullopt};
   }
   predicate_revalidation.Increment();
   // For text predicates, evaluate using the text index instead of raw data.
@@ -175,12 +217,14 @@ bool VerifyFilter(const query::SearchParameters &parameters,
         records, text_index, n.external_id,
         parameters.filter_parse_results.query_operations);
     EvaluationResult result = predicate->Evaluate(evaluator);
-    return result.matches;
+    return {result.matches,
+            result.matches ? std::optional<float>(result.score) : std::nullopt};
   }
   PredicateEvaluator evaluator(
       records, parameters.filter_parse_results.query_operations);
   EvaluationResult result = predicate->Evaluate(evaluator);
-  return result.matches;
+  return {result.matches,
+          result.matches ? std::optional<float>(result.score) : std::nullopt};
 }
 
 // Check if this node owns the slot for the given key in cluster mode
@@ -199,7 +243,8 @@ absl::StatusOr<RecordsMap> GetContentNoReturnJson(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     const query::SearchParameters &parameters,
     const indexes::Neighbor &neighbor,
-    const std::optional<std::string> &vector_identifier) {
+    const std::optional<std::string> &vector_identifier,
+    std::optional<float> *out_recomputed_score = nullptr) {
   auto key = neighbor.external_id->Str();
   absl::flat_hash_set<absl::string_view> identifiers;
   identifiers.insert(kJsonRootElementQuery);
@@ -251,8 +296,15 @@ absl::StatusOr<RecordsMap> GetContentNoReturnJson(
     }
     return content;
   }
-  if (!VerifyFilter(parameters, content, neighbor)) {
-    return absl::NotFoundError("Verify filter failed");
+  {
+    FilterVerification verification =
+        VerifyFilter(parameters, content, neighbor);
+    if (!verification.matches) {
+      return absl::NotFoundError("Verify filter failed");
+    }
+    if (out_recomputed_score != nullptr) {
+      *out_recomputed_score = verification.recomputed_score;
+    }
   }
   RecordsMap return_content;
   static const vmsdk::UniqueValkeyString kJsonRootElementQueryPtr =
@@ -282,13 +334,15 @@ absl::StatusOr<RecordsMap> GetContent(
     ValkeyModuleCtx *ctx, const AttributeDataType &attribute_data_type,
     const query::SearchParameters &parameters,
     const indexes::Neighbor &neighbor,
-    const std::optional<std::string> &vector_identifier) {
+    const std::optional<std::string> &vector_identifier,
+    std::optional<float> *out_recomputed_score = nullptr) {
   auto key = neighbor.external_id->Str();
   if (attribute_data_type.ToProto() ==
           data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_JSON &&
       parameters.return_attributes.empty()) {
     return GetContentNoReturnJson(ctx, attribute_data_type, parameters,
-                                  neighbor, vector_identifier);
+                                  neighbor, vector_identifier,
+                                  out_recomputed_score);
   }
   absl::flat_hash_set<absl::string_view> identifiers;
   for (const auto &return_attribute : parameters.return_attributes) {
@@ -336,8 +390,15 @@ absl::StatusOr<RecordsMap> GetContent(
   if (parameters.filter_parse_results.filter_identifiers.empty()) {
     return content;
   }
-  if (!VerifyFilter(parameters, content, neighbor)) {
-    return absl::NotFoundError("Verify filter failed");
+  {
+    FilterVerification verification =
+        VerifyFilter(parameters, content, neighbor);
+    if (!verification.matches) {
+      return absl::NotFoundError("Verify filter failed");
+    }
+    if (out_recomputed_score != nullptr) {
+      *out_recomputed_score = verification.recomputed_score;
+    }
   }
   if (parameters.return_attributes.empty()) {
     return content;
@@ -372,6 +433,14 @@ absl::StatusOr<RecordsMap> GetContent(
   return return_content;
 }
 
+// Returns true only for non-vector text queries that actually carry a
+// per-document score worth refreshing. Vector queries score by distance and
+// `*` (match-all) has no scoring predicate, so neither needs recompute.
+static bool ShouldRecomputeScores(const SearchParameters &p) {
+  return p.IsNonVectorQuery() && !p.filter_parse_results.is_match_all &&
+         p.filter_parse_results.root_predicate != nullptr;
+}
+
 // Adds all local content for neighbors to the list of neighbors.
 //
 // Any neighbors already contained in the attribute content map will be skipped.
@@ -385,6 +454,9 @@ void ProcessNeighborsForReply(
       options::GetMaxSearchResultRecordSize().GetValue();
   const auto max_content_fields =
       options::GetMaxSearchResultFieldsCount().GetValue();
+  // Tracks whether any neighbor's score changed during recompute, so we only
+  // re-sort the survivors below when ordering could actually have shifted.
+  bool any_score_recomputed = false;
   for (auto &neighbor : neighbors) {
     // Remote neighbors (from fanout) always have attribute_contents populated,
     // so they skip this entire block. Only local neighbors without content
@@ -398,8 +470,9 @@ void ProcessNeighborsForReply(
       // Skip this neighbor - we don't own its slot.
       continue;
     }
+    std::optional<float> recomputed_score;
     auto content = GetContent(ctx, attribute_data_type, parameters, neighbor,
-                              vector_identifier);
+                              vector_identifier, &recomputed_score);
     if (!content.ok()) {
       continue;
     }
@@ -435,6 +508,15 @@ void ProcessNeighborsForReply(
     if (!size_exceeded) {
       neighbor.attribute_contents = std::move(content.value());
     }
+
+    // Apply the score recomputed inline by VerifyFilter's predicate-tree walk.
+    // `recomputed_score` is present only when a sequence mutation triggered the
+    // walk (VerifyFilter's own gate). The ShouldRecomputeScores guard keeps
+    // vector queries and match-all queries from having their score overwritten.
+    if (ShouldRecomputeScores(parameters) && recomputed_score.has_value()) {
+      neighbor.score = *recomputed_score;
+      any_score_recomputed = true;
+    }
   }
   // Remove all entries that don't have content now.
   // TODO: incorporate a retry in case of removal.
@@ -444,6 +526,33 @@ void ProcessNeighborsForReply(
                        return !neighbor.attribute_contents.has_value();
                      }),
       neighbors.end());
+<<<<<<< Updated upstream
+=======
+
+  // Re-rank after recompute. The initial ordering was produced by the search
+  // pass using the pre-mutation scores; if any score changed we must restore
+  // the score-desc / key-asc ordering. We skip this when a SORTBY is present,
+  // since ft_search.cc's ApplySorting owns ordering in that case.
+  // NOTE: this only reorders the already-trimmed survivors. It cannot re-admit
+  // documents that the stale scores excluded earlier during LIMIT trimming.
+  //
+  // We gate on `any_score_recomputed` rather than resorting every non-vector
+  // query: text scores are only real when the matched leaf's iterator was
+  // populated (proximity/slop/inorder). For a plain term match the score is a
+  // neutral 1.0f * weight fallback, so an unconditional resort would reorder on
+  // non-relevance values.
+  if (any_score_recomputed && !parameters.sortby_parameter.has_value()) {
+    std::stable_sort(
+        neighbors.begin(), neighbors.end(),
+        [](const indexes::Neighbor &a, const indexes::Neighbor &b) {
+          if (a.score != b.score) {
+            return a.score > b.score;  // Descending score
+          }
+          // If scores are equal, sort by external_id
+          return a.external_id->Str() < b.external_id->Str();
+        });
+  }
+>>>>>>> Stashed changes
 }
 
 }  // namespace valkey_search::query

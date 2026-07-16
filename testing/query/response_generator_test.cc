@@ -22,6 +22,8 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "src/attribute_data_type.h"
+#include "src/indexes/numeric.h"
+#include "src/indexes/tag.h"
 #include "src/indexes/vector_base.h"
 #include "src/metrics.h"
 #include "src/query/predicate.h"
@@ -295,6 +297,245 @@ TEST_F(ResponseGeneratorTest, ProcessNeighborsForReplyContentLimits) {
   // Verify that the metric was incremented correctly
   // Should be incremented by 2: once for large content, once for many fields
   EXPECT_EQ(Metrics::GetStats().query_result_record_dropped_cnt, 2);
+}
+
+// Builds a MockPredicate whose Evaluate() reports a match and surfaces a
+// specific accumulated score. VerifyFilter returns this score on a mutation
+// walk, so scripting it gives the test a concrete value to assert.
+std::unique_ptr<MockPredicate> MakeScoringPredicate(bool matches, float score) {
+  auto predicate =
+      std::make_unique<MockPredicate>(query::PredicateType::kNumeric);
+  EXPECT_CALL(*predicate, Evaluate(testing::_))
+      .WillRepeatedly([matches, score]([[maybe_unused]] query::Evaluator &e) {
+        query::EvaluationResult r(matches);
+        r.score = score;
+        return r;
+      });
+  return predicate;
+}
+
+// Common HASH fetch mock: ToProto() reports HASH and FetchAllRecords returns
+// two fields (id1, id2) for any key, so content resolution succeeds and the
+// neighbor reaches the scoring path.
+void ExpectFetchReturnsRecords(MockAttributeDataType &data_type) {
+  EXPECT_CALL(data_type, ToProto()).WillRepeatedly([]() {
+    return data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_HASH;
+  });
+  EXPECT_CALL(data_type, FetchAllRecords(testing::_, testing::_, testing::_,
+                                         testing::_, testing::_))
+      .WillRepeatedly([](ValkeyModuleCtx *, const std::optional<std::string> &,
+                         ValkeyModuleKey *, absl::string_view,
+                         const absl::flat_hash_set<absl::string_view> &)
+                          -> absl::StatusOr<RecordsMap> {
+        RecordsMap m;
+        m.emplace("id1", RecordsMapValue(vmsdk::MakeUniqueValkeyString("id1"),
+                                         vmsdk::MakeUniqueValkeyString("v1")));
+        m.emplace("id2", RecordsMapValue(vmsdk::MakeUniqueValkeyString("id2"),
+                                         vmsdk::MakeUniqueValkeyString("v2")));
+        return m;
+      });
+}
+
+// A sequence mutation on a non-vector query with a matching filter triggers the
+// inline recompute walk, and the surfaced score is applied to neighbor.score.
+TEST_F(ResponseGeneratorTest, RecomputesScoreOnSequenceMutation) {
+  ValkeyModuleCtx fake_ctx;
+  EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
+      .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
+
+  UnitTestSearchParameters parameters;
+  parameters.index_schema = CreateIndexSchema("index").value();
+  // Non-vector query: attribute_alias empty => ShouldRecomputeScores true.
+  parameters.attribute_alias = "";
+  // Non-empty filter routes GetContent into the VerifyFilter branch.
+  parameters.filter_parse_results.filter_identifiers = {"id2"};
+  parameters.filter_parse_results.root_predicate =
+      MakeScoringPredicate(/*matches=*/true, /*score=*/7.5f);
+
+  auto external_id = StringInternStore::Intern("external_id1");
+  std::vector<indexes::Neighbor> neighbors;
+  neighbors.push_back(indexes::Neighbor(external_id, /*distance=*/0.0f));
+  neighbors.back().sequence_number = 0;
+  // db_seq (1) != neighbor.sequence_number (0) => VerifyFilter walk runs.
+  parameters.index_schema->SetDbMutationSequenceNumber(external_id, 1);
+
+  MockAttributeDataType data_type;
+  ExpectFetchReturnsRecords(data_type);
+
+  ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                           /*vector_identifier=*/std::nullopt);
+
+  ASSERT_EQ(neighbors.size(), 1);
+  EXPECT_FLOAT_EQ(neighbors[0].score, 7.5f);
+}
+
+// When the stored sequence equals the db mutation sequence (no
+// mutation), VerifyFilter early-returns with no score and neighbor.score is
+// left untouched.
+TEST_F(ResponseGeneratorTest, DoesNotRecomputeWhenNoSequenceMutation) {
+  ValkeyModuleCtx fake_ctx;
+  EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
+      .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
+
+  UnitTestSearchParameters parameters;
+  parameters.index_schema = CreateIndexSchema("index").value();
+  parameters.attribute_alias = "";
+  parameters.filter_parse_results.filter_identifiers = {"id2"};
+  // If the walk were to run it would yield 7.5f; it must NOT run here.
+  parameters.filter_parse_results.root_predicate =
+      MakeScoringPredicate(/*matches=*/true, /*score=*/7.5f);
+
+  auto external_id = StringInternStore::Intern("external_id1");
+  std::vector<indexes::Neighbor> neighbors;
+  neighbors.push_back(indexes::Neighbor(external_id, /*distance=*/2.0f));
+  neighbors.back().sequence_number = 5;
+  const float original_score = neighbors[0].score;  // == distance (2.0f)
+  // db_seq == neighbor.sequence_number => VerifyFilter early-returns nullopt.
+  parameters.index_schema->SetDbMutationSequenceNumber(external_id, 5);
+
+  MockAttributeDataType data_type;
+  ExpectFetchReturnsRecords(data_type);
+
+  ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                           /*vector_identifier=*/std::nullopt);
+
+  ASSERT_EQ(neighbors.size(), 1);
+  EXPECT_FLOAT_EQ(neighbors[0].score, original_score);
+}
+
+// A vector query (non-empty attribute_alias) must not have its score
+// overwritten, even when a sequence mutation makes VerifyFilter produce a
+// score. ShouldRecomputeScores gates on IsNonVectorQuery().
+TEST_F(ResponseGeneratorTest, DoesNotRecomputeScoreForVectorQuery) {
+  ValkeyModuleCtx fake_ctx;
+  EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
+      .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
+
+  UnitTestSearchParameters parameters;
+  parameters.index_schema = CreateIndexSchema("index").value();
+  // Vector query: non-empty attribute_alias => ShouldRecomputeScores false.
+  parameters.attribute_alias = "vector_field";
+  parameters.filter_parse_results.filter_identifiers = {"id2"};
+  parameters.filter_parse_results.root_predicate =
+      MakeScoringPredicate(/*matches=*/true, /*score=*/7.5f);
+
+  auto external_id = StringInternStore::Intern("external_id1");
+  std::vector<indexes::Neighbor> neighbors;
+  neighbors.push_back(indexes::Neighbor(external_id, /*distance=*/3.0f));
+  neighbors.back().sequence_number = 0;
+  const float original_score = neighbors[0].score;  // == distance (3.0f)
+  parameters.index_schema->SetDbMutationSequenceNumber(external_id, 1);
+
+  MockAttributeDataType data_type;
+  ExpectFetchReturnsRecords(data_type);
+
+  ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                           parameters.attribute_alias);
+
+  ASSERT_EQ(neighbors.size(), 1);
+  EXPECT_FLOAT_EQ(neighbors[0].score, original_score);
+}
+
+// HASH fetch mock returning a single {identifier: value} record for any key, so
+// a real leaf predicate can be revalidated against concrete field data.
+void ExpectFetchReturnsField(MockAttributeDataType &data_type,
+                             std::string identifier, std::string value) {
+  EXPECT_CALL(data_type, ToProto()).WillRepeatedly([]() {
+    return data_model::AttributeDataType::ATTRIBUTE_DATA_TYPE_HASH;
+  });
+  EXPECT_CALL(data_type, FetchAllRecords(testing::_, testing::_, testing::_,
+                                         testing::_, testing::_))
+      .WillRepeatedly([identifier, value](
+                          ValkeyModuleCtx *, const std::optional<std::string> &,
+                          ValkeyModuleKey *, absl::string_view,
+                          const absl::flat_hash_set<absl::string_view> &)
+                          -> absl::StatusOr<RecordsMap> {
+        RecordsMap m;
+        m.emplace(identifier,
+                  RecordsMapValue(vmsdk::MakeUniqueValkeyString(identifier),
+                                  vmsdk::MakeUniqueValkeyString(value)));
+        return m;
+      });
+}
+
+// A real NumericPredicate revalidated through the predicate-tree walk
+// contributes 1.0 * weight, matching ComputeMatchedPredicateScore's leaf
+// semantics. This exercises PredicateEvaluator::EvaluateNumeric's leaf scoring.
+TEST_F(ResponseGeneratorTest, RecomputesNumericLeafScore) {
+  ValkeyModuleCtx fake_ctx;
+  EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
+      .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
+
+  UnitTestSearchParameters parameters;
+  parameters.index_schema = CreateIndexSchema("index").value();
+  parameters.attribute_alias = "";
+  parameters.filter_parse_results.filter_identifiers = {"num"};
+
+  // EvaluateNumeric never dereferences the index, so nullptr is sufficient.
+  auto predicate = std::make_unique<query::NumericPredicate>(
+      /*index=*/nullptr, /*alias=*/"num", /*identifier=*/"num",
+      /*start=*/0.0, /*is_inclusive_start=*/true,
+      /*end=*/100.0, /*is_inclusive_end=*/true);
+  predicate->SetWeight(3.0f);
+  parameters.filter_parse_results.root_predicate = std::move(predicate);
+
+  auto external_id = StringInternStore::Intern("external_id1");
+  std::vector<indexes::Neighbor> neighbors;
+  neighbors.push_back(indexes::Neighbor(external_id, /*distance=*/0.0f));
+  neighbors.back().sequence_number = 0;
+  // db_seq (1) != neighbor.sequence_number (0) => VerifyFilter walk runs.
+  parameters.index_schema->SetDbMutationSequenceNumber(external_id, 1);
+
+  MockAttributeDataType data_type;
+  ExpectFetchReturnsField(data_type, "num", "42");
+
+  ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                           /*vector_identifier=*/std::nullopt);
+
+  ASSERT_EQ(neighbors.size(), 1);
+  EXPECT_FLOAT_EQ(neighbors[0].score, 3.0f);  // 1.0 * weight
+}
+
+// A real TagPredicate revalidated through the predicate-tree walk contributes
+// 1.0 * weight, exercising PredicateEvaluator::EvaluateTags' leaf scoring.
+TEST_F(ResponseGeneratorTest, RecomputesTagLeafScore) {
+  ValkeyModuleCtx fake_ctx;
+  EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
+      .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
+
+  // EvaluateTags reads the index's separator and case-sensitivity, so a real
+  // Tag index is required.
+  data_model::TagIndex tag_index_proto;
+  tag_index_proto.set_separator(",");
+  tag_index_proto.set_case_sensitive(false);
+  IndexTeser<indexes::Tag, data_model::TagIndex> tag_index(tag_index_proto);
+
+  UnitTestSearchParameters parameters;
+  parameters.index_schema = CreateIndexSchema("index").value();
+  parameters.attribute_alias = "";
+  parameters.filter_parse_results.filter_identifiers = {"tags"};
+
+  auto predicate = std::make_unique<query::TagPredicate>(
+      &tag_index, /*alias=*/"tags", /*identifier=*/"tags",
+      /*raw_tag_string=*/"tag1",
+      absl::flat_hash_set<absl::string_view>{"tag1"});
+  predicate->SetWeight(2.0f);
+  parameters.filter_parse_results.root_predicate = std::move(predicate);
+
+  auto external_id = StringInternStore::Intern("external_id1");
+  std::vector<indexes::Neighbor> neighbors;
+  neighbors.push_back(indexes::Neighbor(external_id, /*distance=*/0.0f));
+  neighbors.back().sequence_number = 0;
+  parameters.index_schema->SetDbMutationSequenceNumber(external_id, 1);
+
+  MockAttributeDataType data_type;
+  ExpectFetchReturnsField(data_type, "tags", "tag1");
+
+  ProcessNeighborsForReply(&fake_ctx, data_type, neighbors, parameters,
+                           /*vector_identifier=*/std::nullopt);
+
+  ASSERT_EQ(neighbors.size(), 1);
+  EXPECT_FLOAT_EQ(neighbors[0].score, 2.0f);  // 1.0 * weight
 }
 
 INSTANTIATE_TEST_SUITE_P(

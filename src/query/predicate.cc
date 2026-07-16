@@ -438,6 +438,7 @@ EvaluationResult ComposedPredicate::EvaluateWithContext(Evaluator &evaluator,
   if (GetType() == PredicateType::kComposedAnd) {
     uint32_t childrenWithPositions = 0;
     uint64_t query_field_mask = ~0ULL;
+    float score_sum = 0.0f;
     absl::InlinedVector<std::unique_ptr<indexes::text::TextIterator>,
                         indexes::text::kProximityTermsInlineCapacity>
         iterators;
@@ -463,6 +464,7 @@ EvaluationResult ComposedPredicate::EvaluateWithContext(Evaluator &evaluator,
       if (!result.matches) {
         return EvaluationResult(false);
       }
+      score_sum += result.score;
       if (result.filter_iterator) {
         childrenWithPositions++;
         query_field_mask &= result.filter_iterator->QueryFieldMask();
@@ -493,28 +495,44 @@ EvaluationResult ComposedPredicate::EvaluateWithContext(Evaluator &evaluator,
         return EvaluationResult(false);
       }
       // Return the proximity iterator for potential nested use.
-      return {true, std::move(proximity_iterator)};
+      EvaluationResult r{true, std::move(proximity_iterator)};
+      r.score = GetWeight() * score_sum;
+      return r;
     }
     // Propagate the filter iterator from the one child exists
     else if (childrenWithPositions == 1) {
-      return {true, std::move(iterators[0])};
+      EvaluationResult r{true, std::move(iterators[0])};
+      r.score = GetWeight() * score_sum;
+      return r;
     }
     // All matched, but none have position. non-proximity case
-    return EvaluationResult(true);
+    EvaluationResult r(true);
+    r.score = GetWeight() * score_sum;
+    return r;
   }
   // Handle OR logic
   auto filter_iterators =
       absl::InlinedVector<std::unique_ptr<indexes::text::TextIterator>,
                           indexes::text::kProximityTermsInlineCapacity>();
+  float score_sum = 0.0f;
+  bool any_matched = false;
   for (const auto &child : children_) {
     EvaluationResult result =
         EvaluatePredicate(child.get(), evaluator, require_positions, true);
+    if (result.matches) {
+      any_matched = true;
+      score_sum += result.score;  // OR: include every matching child
+    }
     // Short-circuit if any matches and positions not required.
     if (result.matches && !require_positions) {
-      return EvaluationResult(true);
+      EvaluationResult r{true};
+      r.score = GetWeight() * score_sum;
+      return r;
     } else if (result.matches) {
       if (result.filter_iterator == nullptr) {
-        return EvaluationResult(true);
+        EvaluationResult r{true};
+        r.score = GetWeight() * score_sum;
+        return r;
       }
       filter_iterators.push_back(std::move(result.filter_iterator));
     }
@@ -537,7 +555,9 @@ EvaluationResult ComposedPredicate::EvaluateWithContext(Evaluator &evaluator,
     return EvaluationResult(false);
   }
   // Return the OR proximity iterator for potential nested scenarios.
-  return {true, std::move(or_proximity_iterator)};
+  EvaluationResult r{true, std::move(or_proximity_iterator)};
+  r.score = GetWeight() * score_sum;
+  return r;
 }
 
 }  // namespace valkey_search::query

@@ -55,6 +55,9 @@ class NumericPredicate;
 struct EvaluationResult {
   bool matches;
   std::unique_ptr<valkey_search::indexes::text::TextIterator> filter_iterator;
+  // Accumulated relevance score for this subtree. Only meaningful when
+  // `matches` is true. Combined up the tree by ComposedPredicate.
+  float score{0.0f};
 
   // Constructor 1: For non-text predicates (no iterator)
   explicit EvaluationResult(bool result)
