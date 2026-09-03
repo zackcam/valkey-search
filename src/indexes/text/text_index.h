@@ -157,8 +157,16 @@ class TextIndexSchema {
     return GetKeyDocLen(key);
   }
 
+  // The scoring inputs a key's posting entry carries. Deliberately drops
+  // PostingValue::map: DeleteKeyData destroys the FlatPositionMap, so a pointer
+  // to it must not outlive the bucket lock, and scoring never reads positions.
+  struct KeyPostingStats {
+    uint32_t tf = 0;
+    uint32_t doc_len = 0;
+  };
+
   // Per-key scoring lookup: resolves `word` in the key's own text index and
-  // returns that key's posting entry, holding the word's bucket mutex — the one
+  // returns that key's posting stats, holding the word's bucket mutex — the one
   // CommitKeyData/DeleteKeyData take across a Postings insert/erase — so it is
   // safe outside the read phase. nullopt when the key does not carry the word.
   //
@@ -166,13 +174,15 @@ class TextIndexSchema {
   // every mutation, so unlike a Postings pinned earlier it always reaches the
   // live object: re-indexing a word's last holder destroys that Postings and
   // installs a fresh one.
-  std::optional<PostingValue> LookupKeyPosting(const TextIndex &per_key_index,
-                                               absl::string_view word,
-                                               BorrowedInternedStringPtr key) {
+  std::optional<KeyPostingStats> LookupKeyPosting(
+      const TextIndex &per_key_index, absl::string_view word,
+      BorrowedInternedStringPtr key) {
     auto postings = per_key_index.GetPrefix().FindPostingsTarget(word);
     if (!postings) return std::nullopt;
     absl::MutexLock word_lock(&rax_target_mutex_pool_.Get(word));
-    return postings->LookupKey(key);
+    auto entry = postings->LookupKey(key);
+    if (!entry) return std::nullopt;
+    return KeyPostingStats{entry->tf, entry->doc_len};
   }
 
   uint32_t GetKeyNorm(const InternedStringPtr &key) const {
