@@ -104,6 +104,10 @@ class Tag : public IndexBase {
   bool ContainsKey(absl::string_view value, const InternedStringPtr& key) const
       ABSL_NO_THREAD_SAFETY_ANALYSIS;
 
+  // Locking-enabled version of ContainsKey, for callers outside the read phase.
+  bool ContainsKey(absl::string_view value, const InternedStringPtr& key,
+                   bool lock) const ABSL_NO_THREAD_SAFETY_ANALYSIS;
+
   // Iterator yielded by EntriesFetcher::Begin(). Walks a vector of rax slots
   // (each slot's 8 bytes encode a BagOfInternedStringPtrs); for negated
   // queries, also walks an extras vector of untracked keys.

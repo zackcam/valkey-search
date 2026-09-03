@@ -647,6 +647,14 @@ struct ResolvedLeaf {
   absl::InlinedVector<indexes::text::InvasivePtr<indexes::text::Postings>,
                       indexes::text::kStemVariantsInlineCapacity + 1>
       postings;
+  // The words `postings` was resolved from, parallel to it. The main-thread
+  // recompute path re-resolves through the key's own text index (see
+  // ScoreNode), so it needs the words and the schema owning their bucket
+  // mutexes.
+  absl::InlinedVector<std::string,
+                      indexes::text::kStemVariantsInlineCapacity + 1>
+      words;
+  indexes::text::TextIndexSchema *text_index_schema = nullptr;
   uint32_t num_doc_contain_term = 0;
   // Query-invariant per-term weight (BM25 IDF), computed once here instead of
   // per candidate document.
@@ -706,6 +714,7 @@ void ResolveLeaves(const Predicate *predicate, uint32_t total_docs,
       const auto &prefix = text_index->GetPrefix();
 
       ResolvedLeaf leaf;
+      leaf.text_index_schema = text_index_schema.get();
       // Collect the words the term matches on: the original word plus, for a
       // non-exact term on a stemmed field, every variant sharing its stem root
       // (matching TermPredicate::Evaluate). Ingestion stores original words in
@@ -717,6 +726,7 @@ void ResolveLeaves(const Predicate *predicate, uint32_t total_docs,
         if (postings) {
           leaf.num_doc_contain_term += postings->GetKeyCount();
           leaf.postings.push_back(std::move(postings));
+          leaf.words.emplace_back(word);
         }
       };
       add_word(term_pred->GetTextString());
@@ -803,6 +813,12 @@ struct ScoreContext {
   // document score, so the per-candidate GetDocumentScore lookup is skipped.
   bool has_score_field = false;
   float default_document_score = 1.0f;
+  // Set on the main-thread recompute path, which runs outside the read phase:
+  // per-key reads take fine-grained locks and text leaves resolve through the
+  // key's own tree rather than the pinned Postings. Unset on the background
+  // path, which holds the read phase.
+  const indexes::text::TextIndex *per_key_text_index = nullptr;
+  bool lock_per_key_reads = false;
 };
 
 std::optional<float> ScoreNode(const Predicate *predicate,
@@ -859,10 +875,30 @@ std::optional<float> ScoreNode(const Predicate *predicate,
       // scorer, which ScoreLeaf treats as a degenerate corpus and scores 0.
       uint32_t tf = 0;
       uint32_t doc_len = 0;
-      for (const auto &postings : leaf.postings) {
-        if (auto entry = postings->LookupKey(key)) {
-          tf += entry->tf;
-          doc_len = entry->doc_len;
+      if (score_ctx.lock_per_key_reads) {
+        // The pinned Postings can be stale: if this key was a word's last
+        // holder, a delete+re-add destroys it and installs a fresh one. The
+        // key's own tree is rebuilt wholesale per mutation, so it always points
+        // at the live object. The bucket mutex then excludes concurrent
+        // CommitKeyData/DeleteKeyData on the shared key map.
+        if (score_ctx.per_key_text_index == nullptr) return std::nullopt;
+        const auto &per_key_prefix = score_ctx.per_key_text_index->GetPrefix();
+        for (const auto &word : leaf.words) {
+          auto postings = per_key_prefix.FindPostingsTarget(word);
+          if (!postings) continue;
+          absl::MutexLock word_lock(
+              &leaf.text_index_schema->GetWordMutex(word));
+          if (auto entry = postings->LookupKey(key)) {
+            tf += entry->tf;
+            doc_len = entry->doc_len;
+          }
+        }
+      } else {
+        for (const auto &postings : leaf.postings) {
+          if (auto entry = postings->LookupKey(key)) {
+            tf += entry->tf;
+            doc_len = entry->doc_len;
+          }
         }
       }
 
@@ -897,7 +933,9 @@ std::optional<float> ScoreNode(const Predicate *predicate,
 
       uint32_t doc_len = 0;
       if (score_ctx.needs_doc_len && score_ctx.total_docs > 0) {
-        doc_len = score_ctx.index_schema.GetDocumentLength(key);
+        doc_len = score_ctx.lock_per_key_reads
+                      ? score_ctx.index_schema.GetDocumentLengthLocked(key)
+                      : score_ctx.index_schema.GetDocumentLength(key);
       }
 
       // Sum the BM25 term (F ≡ 1) for each resolved value the document carries.
@@ -907,7 +945,10 @@ std::optional<float> ScoreNode(const Predicate *predicate,
       // 0.
       float sum = 0.0f;
       for (const auto &[value, idf] : leaf.tag_values) {
-        if (!leaf.tag_index->ContainsKey(value, key.AsInternedRef())) continue;
+        if (!leaf.tag_index->ContainsKey(value, key.AsInternedRef(),
+                                         score_ctx.lock_per_key_reads)) {
+          continue;
+        }
         sum += score_ctx.scorer->ScoreLeaf({idf, /*term_frequency=*/1, doc_len,
                                             score_ctx.avg_doc_len,
                                             predicate->GetWeight()});
@@ -1044,9 +1085,9 @@ SingleDocumentScorer::SingleDocumentScorer(
   CHECK(scorer != nullptr);
 
   // Reading index_key_info_ / text-index metadata requires the reader lock.
-  // Preferred site is the background thread inside Search(), which already
-  // holds it (kLockAlreadyHeld); the lazy main-thread fallback acquires its
-  // own (kAcquireLock).
+  // Production always constructs from the background thread inside Search(),
+  // which already holds it (kLockAlreadyHeld); kAcquireLock is for tests that
+  // construct without one.
   std::optional<vmsdk::ReaderMutexLock> lock;
   if (lock_policy == LockPolicy::kAcquireLock) {
     lock.emplace(&const_cast<IndexSchema &>(index_schema).GetTimeSlicedMutex());
@@ -1085,13 +1126,20 @@ SingleDocumentScorer::~SingleDocumentScorer() = default;
 std::optional<float> SingleDocumentScorer::Score(
     const InternedStringPtr &key) const {
   if (state_->total_docs == 0) return std::nullopt;
-  // Contract: the caller must NOT already hold the time-sliced mutex (see
-  // class comment in search.h); the reader lock is acquired below.
-  // Per-key reads (LookupTermFrequency, GetDocumentLength, GetDocumentScore)
-  // touch index structures, so take the reader lock for the walk. The
-  // document-independent inputs were captured at construction.
-  vmsdk::ReaderMutexLock lock(
-      &const_cast<IndexSchema &>(state_->index_schema).GetTimeSlicedMutex());
+
+  // Every per-key read below takes the same fine-grained lock its writer holds,
+  // so no time-sliced mutex is needed. Text leaves resolve through the key's
+  // own text index; fetch it once here rather than per leaf.
+  //
+  // Walking that tree unlocked relies on the key having no in-flight mutation,
+  // which PerformKeyContentionCheck guarantees only for
+  // kContentionCheckRequired queries — exactly the set that reaches a text
+  // leaf, since QueryHasTextPredicate is what selects that mode.
+  auto *text_index_schema = state_->index_schema.GetTextIndexSchema().get();
+  const indexes::text::TextIndex *per_key_text_index =
+      text_index_schema != nullptr
+          ? text_index_schema->GetPerKeyTextIndex(key, /*lock=*/true)
+          : nullptr;
 
   ScoreContext score_ctx{state_->index_schema,
                          state_->scorer,
@@ -1101,7 +1149,9 @@ std::optional<float> SingleDocumentScorer::Score(
                          state_->avg_doc_len,
                          state_->needs_doc_len,
                          state_->has_score_field,
-                         state_->default_document_score};
+                         state_->default_document_score,
+                         per_key_text_index,
+                         /*lock_per_key_reads=*/true};
   const BorrowedInternedStringPtr borrowed_key(key);
   // Single source of scoring math: the same ScoreNode walk ScoreTextQuery runs
   // per candidate. nullopt means ScoreNode re-derived a non-match (e.g. a term
@@ -1111,7 +1161,7 @@ std::optional<float> SingleDocumentScorer::Score(
   if (!sum) return std::nullopt;
   const float document_score =
       score_ctx.has_score_field
-          ? state_->index_schema.GetDocumentScore(borrowed_key)
+          ? state_->index_schema.GetDocumentScoreLocked(borrowed_key)
           : score_ctx.default_document_score;
   return state_->scorer->ComposeDocumentScore(*sum, document_score);
 }
@@ -1476,12 +1526,12 @@ absl::Status Search(SearchParameters &parameters, SearchMode search_mode) {
     // and the main-thread content fetch, and the snapshot taken here (corpus
     // stats, per-term IDF) matches the corpus the surviving candidates were
     // just scored with. Skipped when no reply-side recompute can happen: no
-    // predicate (match-all), no results, or a NOCONTENT reply.
+    // predicate (match-all), no results, or a reply that fetches no content.
     const Predicate *root_predicate =
         parameters.filter_parse_results.root_predicate.get();
     if (root_predicate != nullptr &&
         !parameters.search_result.neighbors.empty() &&
-        parameters.GetContentProcessing() != kNoContent) {
+        parameters.WillFetchContentOnMainThread()) {
       parameters.recompute_scorer = std::make_unique<SingleDocumentScorer>(
           *parameters.index_schema, root_predicate,
           indexes::scoring::GetScorer(parameters.scorer),

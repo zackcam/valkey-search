@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -332,6 +333,13 @@ bool Tag::ContainsKey(absl::string_view value,
   bool found = bag.contains(key);
   (void)bag.Release();
   return found;
+}
+
+bool Tag::ContainsKey(absl::string_view value, const InternedStringPtr& key,
+                      bool lock) const {
+  std::optional<absl::MutexLock> guard;
+  if (lock) guard.emplace(&index_mutex_);
+  return ContainsKey(value, key);
 }
 
 // -- Search / EntriesFetcher / EntriesFetcherIterator --------------------

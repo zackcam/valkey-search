@@ -13,6 +13,7 @@
 #include <cctype>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "absl/base/thread_annotations.h"
@@ -143,9 +144,23 @@ class TextIndexSchema {
   // Takes a borrowed key so neither scoring path (post-filter walk in
   // search.cc, in-iterator hot path in term.cc) incurs ref-count churn; owning
   // callers wrap their key in a BorrowedInternedStringPtr.
+  // No locking needed because only called from read phase.
   uint32_t GetKeyDocLen(BorrowedInternedStringPtr key) const {
     auto itr = per_key_scoring_info_.find(key.AsInternedRef());
     return itr != per_key_scoring_info_.end() ? itr->second.doc_len : 0;
+  }
+
+  // Locking-enabled version of GetKeyDocLen.
+  uint32_t GetKeyDocLen(BorrowedInternedStringPtr key, bool lock) const {
+    std::optional<std::lock_guard<std::mutex>> per_key_guard;
+    if (lock) per_key_guard.emplace(per_key_text_indexes_mutex_);
+    return GetKeyDocLen(key);
+  }
+
+  // The bucket mutex CommitKeyData/DeleteKeyData hold across a Postings
+  // insert/erase. Readers outside the read phase take it to exclude them.
+  absl::Mutex &GetWordMutex(absl::string_view word) {
+    return rax_target_mutex_pool_.Get(word);
   }
 
   uint32_t GetKeyNorm(const InternedStringPtr &key) const {
