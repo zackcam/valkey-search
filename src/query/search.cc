@@ -650,10 +650,10 @@ struct ResolvedLeaf {
   // The words `postings` was resolved from, parallel to it. The main-thread
   // recompute path re-resolves through the key's own text index (see
   // ScoreNode), so it needs the words and the schema owning their bucket
-  // mutexes.
-  absl::InlinedVector<std::string,
-                      indexes::text::kStemVariantsInlineCapacity + 1>
-      words;
+  // mutexes. Inline capacity 1 covers the original word, the only entry unless
+  // the term also expands to stem variants; std::string is 32 bytes, so sizing
+  // this like `postings` would cost 680 bytes per leaf.
+  absl::InlinedVector<std::string, 1> words;
   indexes::text::TextIndexSchema *text_index_schema = nullptr;
   uint32_t num_doc_contain_term = 0;
   // Query-invariant per-term weight (BM25 IDF), computed once here instead of
@@ -813,12 +813,17 @@ struct ScoreContext {
   // document score, so the per-candidate GetDocumentScore lookup is skipped.
   bool has_score_field = false;
   float default_document_score = 1.0f;
-  // Set on the main-thread recompute path, which runs outside the read phase:
-  // per-key reads take fine-grained locks and text leaves resolve through the
-  // key's own tree rather than the pinned Postings. Unset on the background
-  // path, which holds the read phase.
-  const indexes::text::TextIndex *per_key_text_index = nullptr;
-  bool lock_per_key_reads = false;
+  // Present only when scoring for a main-thread revalidation, which runs
+  // outside the read phase. Its presence is what tells the per-key reads below
+  // to take fine-grained locks; the background path leaves it empty and relies
+  // on holding the read phase instead.
+  struct MainThreadRevalidation {
+    // The scored key's own text index, fetched once per key. Text leaves
+    // resolve through it rather than the Postings pinned at construction, which
+    // can be stale. Null when the key carries no text data.
+    const indexes::text::TextIndex *per_key_text_index = nullptr;
+  };
+  std::optional<MainThreadRevalidation> main_thread_revalidation;
 };
 
 std::optional<float> ScoreNode(const Predicate *predicate,
@@ -875,20 +880,16 @@ std::optional<float> ScoreNode(const Predicate *predicate,
       // scorer, which ScoreLeaf treats as a degenerate corpus and scores 0.
       uint32_t tf = 0;
       uint32_t doc_len = 0;
-      if (score_ctx.lock_per_key_reads) {
-        // The pinned Postings can be stale: if this key was a word's last
-        // holder, a delete+re-add destroys it and installs a fresh one. The
-        // key's own tree is rebuilt wholesale per mutation, so it always points
-        // at the live object. The bucket mutex then excludes concurrent
-        // CommitKeyData/DeleteKeyData on the shared key map.
-        if (score_ctx.per_key_text_index == nullptr) return std::nullopt;
-        const auto &per_key_prefix = score_ctx.per_key_text_index->GetPrefix();
+      if (score_ctx.main_thread_revalidation.has_value()) {
+        // Off the read phase: go through the key's own text index rather than
+        // the Postings pinned at construction, which can be stale. See
+        // TextIndexSchema::LookupKeyPosting.
+        const auto *per_key_index =
+            score_ctx.main_thread_revalidation->per_key_text_index;
+        if (per_key_index == nullptr) return std::nullopt;
         for (const auto &word : leaf.words) {
-          auto postings = per_key_prefix.FindPostingsTarget(word);
-          if (!postings) continue;
-          absl::MutexLock word_lock(
-              &leaf.text_index_schema->GetWordMutex(word));
-          if (auto entry = postings->LookupKey(key)) {
+          if (auto entry = leaf.text_index_schema->LookupKeyPosting(
+                  *per_key_index, word, key)) {
             tf += entry->tf;
             doc_len = entry->doc_len;
           }
@@ -933,7 +934,7 @@ std::optional<float> ScoreNode(const Predicate *predicate,
 
       uint32_t doc_len = 0;
       if (score_ctx.needs_doc_len && score_ctx.total_docs > 0) {
-        doc_len = score_ctx.lock_per_key_reads
+        doc_len = score_ctx.main_thread_revalidation.has_value()
                       ? score_ctx.index_schema.GetDocumentLengthLocked(key)
                       : score_ctx.index_schema.GetDocumentLength(key);
       }
@@ -945,8 +946,9 @@ std::optional<float> ScoreNode(const Predicate *predicate,
       // 0.
       float sum = 0.0f;
       for (const auto &[value, idf] : leaf.tag_values) {
-        if (!leaf.tag_index->ContainsKey(value, key.AsInternedRef(),
-                                         score_ctx.lock_per_key_reads)) {
+        if (!leaf.tag_index->ContainsKey(
+                value, key.AsInternedRef(),
+                score_ctx.main_thread_revalidation.has_value())) {
           continue;
         }
         sum += score_ctx.scorer->ScoreLeaf({idf, /*term_frequency=*/1, doc_len,
@@ -1141,17 +1143,17 @@ std::optional<float> SingleDocumentScorer::Score(
           ? text_index_schema->GetPerKeyTextIndex(key, /*lock=*/true)
           : nullptr;
 
-  ScoreContext score_ctx{state_->index_schema,
-                         state_->scorer,
-                         state_->resolved,
-                         state_->total_docs,
-                         state_->total_doc_len,
-                         state_->avg_doc_len,
-                         state_->needs_doc_len,
-                         state_->has_score_field,
-                         state_->default_document_score,
-                         per_key_text_index,
-                         /*lock_per_key_reads=*/true};
+  ScoreContext score_ctx{
+      state_->index_schema,
+      state_->scorer,
+      state_->resolved,
+      state_->total_docs,
+      state_->total_doc_len,
+      state_->avg_doc_len,
+      state_->needs_doc_len,
+      state_->has_score_field,
+      state_->default_document_score,
+      ScoreContext::MainThreadRevalidation{per_key_text_index}};
   const BorrowedInternedStringPtr borrowed_key(key);
   // Single source of scoring math: the same ScoreNode walk ScoreTextQuery runs
   // per candidate. nullopt means ScoreNode re-derived a non-match (e.g. a term

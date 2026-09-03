@@ -157,10 +157,22 @@ class TextIndexSchema {
     return GetKeyDocLen(key);
   }
 
-  // The bucket mutex CommitKeyData/DeleteKeyData hold across a Postings
-  // insert/erase. Readers outside the read phase take it to exclude them.
-  absl::Mutex &GetWordMutex(absl::string_view word) {
-    return rax_target_mutex_pool_.Get(word);
+  // Per-key scoring lookup: resolves `word` in the key's own text index and
+  // returns that key's posting entry, holding the word's bucket mutex — the one
+  // CommitKeyData/DeleteKeyData take across a Postings insert/erase — so it is
+  // safe outside the read phase. nullopt when the key does not carry the word.
+  //
+  // `per_key_index` comes from GetPerKeyTextIndex() and is rebuilt wholesale on
+  // every mutation, so unlike a Postings pinned earlier it always reaches the
+  // live object: re-indexing a word's last holder destroys that Postings and
+  // installs a fresh one.
+  std::optional<PostingValue> LookupKeyPosting(const TextIndex &per_key_index,
+                                               absl::string_view word,
+                                               BorrowedInternedStringPtr key) {
+    auto postings = per_key_index.GetPrefix().FindPostingsTarget(word);
+    if (!postings) return std::nullopt;
+    absl::MutexLock word_lock(&rax_target_mutex_pool_.Get(word));
+    return postings->LookupKey(key);
   }
 
   uint32_t GetKeyNorm(const InternedStringPtr &key) const {
