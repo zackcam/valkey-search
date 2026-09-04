@@ -236,7 +236,8 @@ struct SearchParameters {
   // IDF, avg_doc_len) the other candidates were scored with, so a recomputed
   // score is scale-consistent with the carried scores. Null when the query
   // cannot need a recompute, and for the CME coordinator, which never runs
-  // Search() and borrows local_responder_'s instead.
+  // Search() and never needs one: neighbors that arrive already populated skip
+  // VerifyFilter entirely.
   std::unique_ptr<SingleDocumentScorer> recompute_scorer;
   struct ParseTimeVariables {
     // Members of this struct are only valid during the parsing of
@@ -274,10 +275,11 @@ struct SearchParameters {
     return sortby_parameter.has_value();
   }
 
-  // Gates the background pre-build of recompute_scorer. The default matches
-  // GetContentProcessing() != kNoContent; overridden by operations that fetch
-  // content anyway (FT.AGGREGATE) and by the CME local responder.
-  virtual bool WillFetchContentOnMainThread() const { return !no_content; }
+  // Gates the background pre-build of recompute_scorer, matching
+  // GetContentProcessing() != kNoContent. Not virtual: forcing this true for a
+  // no_content query would enable a recompute without the contention check its
+  // per-key text index walk depends on.
+  bool WillFetchContentOnMainThread() const { return !no_content; }
 
   virtual absl::Status PreParseQueryString();
   virtual absl::Status PostParseQueryString();

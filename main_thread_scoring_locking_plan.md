@@ -1,8 +1,22 @@
 # Main-thread scoring without the time-slice mutex
 
-**Status: implemented.** Both parts are in the working tree. Verification results are at the bottom.
-Outstanding items are perf-only, not correctness: the main-thread per-key cost, and how coarse tag locking
-should be.
+**Status: pushed; the open correctness item is now fixed in the working tree.** Commits on
+`BCathcart/valkey-search:brennan-scoring-locking` (base `zackcam:search-comments2`):
+
+```
+67db658 Return only scoring fields from LookupKeyPosting
+d4cd54e Tidy up main-thread scoring internals
+5e454db Score on the main thread without the time-slice mutex
+```
+
+**Do not amend or force-push these** — a PR is open against them; follow-ups go in new commits.
+
+The `no_content` FT.AGGREGATE path (see "Resolved item" below) is fixed in an uncommitted follow-up. Still
+outstanding, perf-only: main-thread per-key cost, and tag-locking coarseness. Also filed for later:
+`ADDSCORES` is a parsed no-op (see "ADDSCORES" below).
+
+**Read "Claim reliability" below before trusting any statement in this document about FT.AGGREGATE
+semantics.** Several were asserted from partial reads and turned out wrong.
 
 ## Context
 
@@ -76,13 +90,27 @@ recomputed score on the same scale as the carried neighbor scores. Bonus: member
 Background `ScoreTextQuery` keeps the pinned-postings route: it runs inside the read phase against the same
 snapshot, so it has no staleness window and no reason to pay for a rax walk.
 
-**The quiescence premise holds exactly where it is needed.** Walking the per-key tree without a lock relies on
-the key having no in-flight mutation, which `PerformKeyContentionCheck` only guarantees for
-`kContentionCheckRequired` queries. That is sufficient because the two conditions coincide: a query reaches
-the `kText` branch only if it has a text predicate, and `QueryHasTextPredicate` is precisely what makes
-`GetContentProcessing()` return `kContentionCheckRequired`. Tag/numeric-only queries skip the contention
-check but never touch a per-key tree — their reads go through `Tag::index_mutex_`,
-`per_key_text_indexes_mutex_`, and `mutated_records_mutex_`, none of which depend on quiescence.
+**The quiescence premise — and where the original claim was WRONG.** Walking the per-key tree without a lock
+relies on the key having no in-flight mutation, which `PerformKeyContentionCheck` only guarantees for
+`kContentionCheckRequired` queries.
+
+This document previously claimed the two conditions coincide, because `QueryHasTextPredicate` is what makes
+`GetContentProcessing()` return `kContentionCheckRequired`. **That is false.** `GetContentProcessing()` tests
+`no_content` *first* and returns `kNoContent` before it ever looks for a text predicate:
+
+```cpp
+if (no_content) return kNoContent;                       // <-- short-circuits
+if (query::QueryHasTextPredicate(*this)) return kContentionCheckRequired;
+return kContentRequired;
+```
+
+So a text-predicate query with `no_content` set gets `kNoContent`, never runs `ResolveContent`, and never runs
+the contention check — yet could still reach the `kText` scoring branch. Only `no_content`
+FT.AGGREGATE ever did this, and it no longer fetches content at all. See "Resolved item".
+
+Tag/numeric-only queries do skip the contention check but never touch a per-key tree — their reads go through
+`Tag::index_mutex_`, `per_key_text_indexes_mutex_`, and `mutated_records_mutex_`, none of which depend on
+quiescence. That part still holds.
 
 ---
 
@@ -101,49 +129,52 @@ acquisition.
 **[search.h:282](src/query/search.h#L282)** — new virtual on `SearchParameters`:
 
 ```cpp
-// Gates the background pre-build of recompute_scorer. The default matches
-// GetContentProcessing() != kNoContent; overridden by operations that fetch
-// content anyway (FT.AGGREGATE) and by the CME local responder.
-virtual bool WillFetchContentOnMainThread() const { return !no_content; }
+// Gates the background pre-build of recompute_scorer, matching
+// GetContentProcessing() != kNoContent. Deliberately NOT virtual: every
+// operation that fetches content on the main thread does so under a
+// no_content == false parameter set, and a subclass that forced this to true
+// anyway would enable a recompute on a query that never ran the contention
+// check the recompute's per-key text index walk depends on.
+bool WillFetchContentOnMainThread() const { return !no_content; }
 ```
 
 **[search.cc:1534](src/query/search.cc#L1534)** — pre-build gate switched from
 `GetContentProcessing() != kNoContent` to `WillFetchContentOnMainThread()`.
 
-The base-class default is **behavior-identical**, not a widening: `GetContentProcessing()` returns
-`kNoContent` iff `no_content`, so `!no_content` ≡ `GetContentProcessing() != kNoContent`. Only the two
-overrides change anything, so no existing non-CME path starts building a scorer it previously skipped.
+This is **behavior-identical**, not a widening: `GetContentProcessing()` returns `kNoContent` iff
+`no_content`, so `!no_content` ≡ `GetContentProcessing() != kNoContent`. The named accessor exists to state
+the property the pre-build actually depends on, and it is **non-virtual on purpose** — overriding it is what
+produced the use-after-free below, so the invariant is now structural rather than comment-enforced.
 
-**[ft_aggregate_parser.h:79](src/commands/ft_aggregate_parser.h#L79)** — override → `true` on
-`AggregateParameters`. FT.AGGREGATE sets `no_content = !content` but still calls
-`ProcessNeighborsForReply` unconditionally ([ft_aggregate.cc:240](src/commands/ft_aggregate.cc#L240)).
+> Earlier revisions of this plan added two overrides returning `true` — on `AggregateParameters` and on
+> `LocalResponderSearch` — plus a scorer borrow chain in `VerifyFilter`. All three are **removed**; see
+> "Resolved item" below. The only thing they served was `no_content` FT.AGGREGATE, which no longer fetches
+> content at all.
 
-**[fanout.cc:248](src/query/fanout.cc#L248)** — override → `true` on `LocalResponderSearch`, so the shard
-that actually runs `Search()` builds the scorer under its own reader lock.
-
-**[response_generator.cc:203-214](src/query/response_generator.cc#L203-L214)** — the lazy construction is
-replaced by a borrow chain:
+**[response_generator.cc:203-210](src/query/response_generator.cc#L203-L210)** — the lazy construction is
+replaced by a straight read of the pre-built scorer:
 
 ```cpp
 const query::SingleDocumentScorer *scorer = parameters.recompute_scorer.get();
-if (scorer == nullptr && parameters.local_responder_ != nullptr) {
-  scorer = parameters.local_responder_->recompute_scorer.get();
-}
 if (scorer == nullptr) {
   recompute_scorer_missing.Increment();   // dev counter, expected to stay 0
   return {true, std::nullopt};            // keep the carried score
 }
 ```
 
+No borrow is needed: `ProcessNeighborsForReply` skips any neighbor that already has
+`attribute_contents` ([response_generator.cc:462](src/query/response_generator.cc#L462)), so a neighbor
+resolved by another shard never reaches `VerifyFilter`. Every neighbor that does reach it belongs to the
+`SearchParameters` that ran `Search()` and therefore pre-built the scorer under its own reader lock.
+
 A `DCHECK` was considered and rejected: it would abort debug builds on a path that cannot be proven
 unreachable, and it makes the fall-through untestable. The counter is observable from `INFO SEARCH` as
 `search_recompute_scorer_missing` ([response_generator.cc:158](src/query/response_generator.cc#L158)) and is
 what the integration test asserts on.
 
-Ordering is safe: `local_responder_` is stashed at
-[fanout.cc:277-280](src/query/fanout.cc#L277-L280) *before* `tracker_copy` drops, and the tracker dtor is
-what generates the reply. Semantics are right too: only locally-owned keys are recomputed, and each shard
-scores against its own slot-local corpus.
+`local_responder_` ([search.h:313](src/query/search.h#L313)) is **retained** — it still anchors the
+`RecordsMap` `string_view` lifetimes ([fanout.cc:277-280](src/query/fanout.cc#L277-L280)). Only the scorer
+borrow through it is gone.
 
 The `document_scorer` out-parameter is deleted from `VerifyFilter` / `GetContentNoReturnJson` /
 `GetContent` / `ProcessNeighborsForReply`. `LockPolicy::kAcquireLock` now has no production caller —
@@ -195,8 +226,8 @@ compiler still enforces which path may skip the lock.
 | `ScoreIsSafeAgainstCommitsOnTheSameWord` | [search_test.cc:1901](testing/search_test.cc#L1901) | Word-bucket lock, under TSAN. |
 | `ScoreDoesNotTakeTimeSlicedMutex` | [search_test.cc:1845](testing/search_test.cc#L1845) | `Score()` is callable with the reader lock held (would deadlock before). |
 | `RecomputeScorerGateTest.DefaultsToContentFetchingQueries` | [search_test.cc:1946](testing/search_test.cc#L1946) | Base gate ≡ `GetContentProcessing() != kNoContent`. |
-| `AggregateTest.AlwaysFetchesContentOnMainThread` | [ft_aggregate_parser_test.cc:314](testing/ft_aggregate_parser_test.cc#L314) | The FT.AGGREGATE override. |
-| `RecomputeBorrowsLocalResponderScorer` | [response_generator_test.cc:395](testing/query/response_generator_test.cc#L395) | Borrow chain replaces the carried score. |
+| `AggregateTest.NoContentDoesNotFetchContentOnMainThread` | [ft_aggregate_parser_test.cc:314](testing/ft_aggregate_parser_test.cc#L314) | FT.AGGREGATE uses the base gate — `no_content` claims no fetch. |
+| `RecomputeUsesPreBuiltScorer` | [response_generator_test.cc:399](testing/query/response_generator_test.cc#L399) | The pre-built scorer replaces the stale carried score. |
 | `RecomputeKeepsCarriedScoreWithoutScorer` | [response_generator_test.cc:428](testing/query/response_generator_test.cc#L428) | Fall-through keeps the score, no crash. |
 
 Stale lock comments in `RecomputePathMatchesExtraStepAtNonZero` and
@@ -209,20 +240,145 @@ extra-step path.
 `btree_map<InternedStringPtr, PostingValue>`, plus an `operator delete` race. This was verified before
 merging: a race test that cannot fail without the fix proves nothing.
 
-**Integration — [test_scoring_recompute_cluster.py](integration/test_scoring_recompute_cluster.py), 2 pass.**
+**Integration — [test_scoring_recompute_cluster.py](integration/test_scoring_recompute_cluster.py), 3 pass.**
 Uses the existing `block_mutation_queue` pausepoint (as `test_postfilter.py` does) to park a mutation
 deterministically, and a numeric/tag index so revalidation runs synchronously instead of parking the query.
 The mutation touches a field *outside* the filter, so revalidation still matches and actually reaches the
 recompute.
 
-- `test_aggregate_no_content_borrows_local_responder_scorer` — **fails without Part 1's overrides**
-  (`search_recompute_scorer_missing` reaches 1). This is what established that the CME gap is
-  FT.AGGREGATE-specific.
-- `test_search_recomputes_on_local_responder` — passes with or without the overrides, confirming FT.SEARCH
-  with content is handled entirely on the responder.
+- `test_aggregate_no_content_skips_main_thread_fetch` — asserts `search_predicate_revalidation` does **not**
+  move, which proves the fetch was skipped: `VerifyFilter` is only reachable from
+  `ProcessNeighborsForReply`. Before the fix this same shape incremented the counter and, without the (now
+  removed) overrides, also drove `search_recompute_scorer_missing` to 1 — which is what established the CME
+  gap was FT.AGGREGATE-specific in the first place.
+- `test_aggregate_with_load_still_recomputes` — a real LOAD clears `no_content`, so revalidation and the
+  recompute still run. Pins that the fix did not narrow the content path.
+- `test_search_recomputes_on_local_responder` — passed with or without the overrides, confirming FT.SEARCH
+  with content is handled entirely on the responder, off its own scorer.
 
 **Build.** `ninja -C .build-release` clean; `clang-format` clean on all changed files (the single violation
 in `ft_aggregate_parser.h` is pre-existing).
+
+## Resolved item — `no_content` FT.AGGREGATE
+
+**The bug.** `AggregateParameters::WillFetchContentOnMainThread() -> true` enabled the score recompute on a
+path where the contention check never ran. `Score()` then walks the key's per-key `TextIndex` unlocked while a
+mutation thread can free it:
+
+- `GetPerKeyTextIndex(key, /*lock=*/true)` returns `&it->second` and releases the mutex — the lock covers the
+  *map lookup*, not the lifetime of the pointee.
+- `DeleteKeyData` does `per_key_text_indexes_.extract(key)`; the `node_type` destructs at end of scope,
+  destroying that `TextIndex` and its `Rax`. `node_hash_map` gives stability across rehash, not against erase.
+- Nothing parks the query, so those can overlap. Use-after-free.
+
+**Why the main-thread fetch is pointless there anyway** (verified by reading `ft_aggregate.cc`):
+
+- With no LOAD, `return_attributes` is empty, so `GetContent` fetches *every* field of every key — one
+  `ValkeyModule_OpenKey` per neighbor.
+- Then all of it is discarded: `if (n.attribute_contents.has_value() && !parameters.no_content)` at
+  [ft_aggregate.cc:289](src/commands/ft_aggregate.cc#L289).
+- `n.score` is written into the record only under `if (parameters.IsVectorQuery())`, and vector queries never
+  recompute (`recompute_score = parameters.IsNonVectorQuery()`), so no aggregate reads a recomputed score *as a
+  value*. It is not entirely inert on the content path, though: a recompute sets `any_score_recomputed`, which
+  re-ranks neighbors via the `stable_sort` at
+  [response_generator.cc:538](src/query/response_generator.cc#L538) and so changes record order.
+- The only other live effects under `no_content` were `VerifyFilter` dropping stale matches,
+  `CheckSlotOwnership`, and the erase-neighbors-without-content step.
+
+**Fix applied.** Guard the `ProcessNeighborsForReply` call in `ProcessNeighborsForProcessing` on
+`!no_content` — the guard FT.SEARCH already has, via `HandleEarlyReplyScenarios` at
+[ft_search.cc:344](src/commands/ft_search.cc#L344). With the fetch gone, `AggregateParameters`' and
+`LocalResponderSearch`' overrides and the `VerifyFilter` borrow are all dead and were removed.
+
+The guard wraps the **call only**, not the whole function: the `AddRecordAttribute` calls above it establish
+`key_index` / `scores_index` and must still run.
+
+**The content path is unchanged.** `FT.AGGREGATE ... LOAD @f` has `no_content == false`, so it still fetches,
+revalidates, and recomputes exactly as FT.SEARCH does — pinned by
+`test_aggregate_with_load_still_recomputes`.
+
+**Accepted behaviour change, matching FT.SEARCH NOCONTENT.** Without the fetch, keys that were deleted,
+expired, mutated out of the filter, or that live in a slot this shard no longer owns are no longer pruned, so
+`FT.AGGREGATE idx "<query>" GROUPBY 0 REDUCE COUNT 0` can over-count. FT.SEARCH NOCONTENT already returns
+exactly this staleness: `HandleEarlyReplyScenarios` returns before `ProcessNeighborsForQuery`, so it never
+prunes, never revalidates, and never checks slot ownership either.
+
+**This also closes what an earlier draft called a separate pre-existing UAF.** `VerifyFilter`'s own predicate
+revalidation ([response_generator.cc:224-231](src/query/response_generator.cc#L224-L231)) uses the same
+fetch-pointer-then-release pattern on `GetPerKeyTextIndex` and walks it in `TermPredicate::Evaluate`. It is not
+independent: `ProcessNeighborsForReply` now only runs when `GetContentProcessing() != kNoContent`, and any
+query with a text predicate in that set is `kContentionCheckRequired`, so the key is quiesced. The aggregate
+override was the only thing that broke that invariant. Removing it closes `VerifyFilter`'s walk and
+`SingleDocumentScorer::Score()`'s walk together, and makes the comment at
+[search.cc:1133-1139](src/query/search.cc#L1133-L1139) true as written.
+
+**Second, separate aggregate bug found while investigating.** `no_content` is derived solely from `loads_`,
+but `MakeReference` registers a record slot for every `@field` a stage references *without* adding it to
+`loads_`. So `FT.AGGREGATE idx "<query>" FILTER "@n > 5"` with no LOAD sets `no_content = true`, and the
+field's slot is never populated (line 289 refuses to copy contents in) — the stage evaluates against an empty
+value. Suspected already-broken on `main`, independent of locking. **Still unverified — confirm with an
+integration test before acting.** Note the ADDSCORES probe below shows a stage referencing a field *absent
+from the schema* is rejected at compile time, so this bug (if real) is narrower than first described: it needs
+a field that **is** in the schema but absent from `loads_`.
+
+---
+
+## ADDSCORES is a parsed no-op (found while investigating; pinned by test, not fixed)
+
+`ADDSCORES` is meant to expose each document's relevance score to the aggregation pipeline, the way FT.SEARCH
+`WITHSCORES` exposes it to the reply. It parses into `AggregateParameters::addscores_`
+([ft_aggregate_parser.cc:245](src/commands/ft_aggregate_parser.cc#L245), via `GENERATE_FLAG_PARSER`) and that
+field is **read nowhere else in the codebase**. The keyword silently succeeds and does nothing.
+
+Combined with the point above — `n.score` reaching a record only under `IsVectorQuery()` — there is no route at
+all from a non-vector relevance score to aggregate output. The score is computed, and recomputed on the main
+thread when a document mutated mid-query, and then dropped.
+
+Observed on a running server (text+numeric index, `FT.AGGREGATE idx "hello" ...`):
+
+| Command | Result |
+|---|---|
+| `ADDSCORES LOAD 1 @n` | reply **byte-identical** to the same command without `ADDSCORES` |
+| `ADDSCORES LOAD 2 @n @__score` | `Index field `__score` does not exist` |
+| `ADDSCORES ... SORTBY 2 @__score DESC` | `Error parsing value for the parameter `SORTBY` - Index field `__score` does not exist` |
+
+So `@__score` is resolved as an ordinary schema attribute; there is no synthetic score field for a stage to
+reference.
+
+Not fixed here: it is a feature gap, not a locking issue, and implementing it means choosing a field name
+(Redis uses `@__score`) and wiring it through `record_indexes_by_alias_`. Pinned instead by
+[integration/test_aggregate_addscores.py](integration/test_aggregate_addscores.py), which asserts the current
+no-op behaviour and carries a `TODO` plus the assertions that should replace it once implemented, so the
+change is caught rather than shipped silently.
+
+Note this cuts *against* removing the recompute from the content path: once `ADDSCORES` works, the recomputed
+score becomes directly observable there.
+
+---
+
+## Claim reliability
+
+Two confident claims in earlier drafts of this document were wrong. Verify before relying on anything here
+about FT.AGGREGATE.
+
+| Claim | Verdict |
+|---|---|
+| The CME scorer gap affects *every* clustered content query | **Wrong.** FT.SEARCH-with-content is handled on the local responder, which resolves its own content; its neighbors reach the coordinator populated and are skipped. The gap is FT.AGGREGATE-with-`no_content` only. Caught because the integration test passed with the fix reverted. |
+| `kText` branch implies `kContentionCheckRequired`, so the unlocked per-key walk is safe | **Was wrong, now true.** `GetContentProcessing()` tests `no_content` first and returns `kNoContent` before it ever calls `QueryHasTextPredicate`, so a `no_content` text aggregate reached the `kText` branch with no contention check. The fix above removes the only path that did this, so the invariant now holds. |
+| The recompute is unobservable for *all* FT.AGGREGATE | **Overstated.** The recomputed *value* never reaches output (no route for non-vector; `ADDSCORES` is a no-op), but a recompute sets `any_score_recomputed` and re-ranks neighbors via the `stable_sort`, which does change record order on the content path. |
+| `LocalResponderSearch` needs `WillFetchContentOnMainThread() -> true` for CME | **Only for `no_content` FT.AGGREGATE**, which no longer fetches. For FT.SEARCH-with-content the responder resolves its own content and recomputes off its own scorer; populated neighbors are then skipped at [response_generator.cc:462](src/query/response_generator.cc#L462). Override removed. |
+| Aggregate stages are value-independent under `no_content` | **Wrong.** Stages can reference `@field` via `MakeReference`; those references are simply never populated. |
+| `SendReply` / aggregate stages run on a background thread | **Wrong.** `async::Reply` is the blocked-client callback, so all of `SendReplyInner` — including FILTER/APPLY/SORTBY/GROUPBY — runs on the main thread. |
+
+Verified and trustworthy: everything in "Verification results" (test outcomes, TSAN behaviour with and
+without the word lock), the lock-substitution table, and the stale-`Postings` analysis — each was checked
+against code or demonstrated by a test that fails without the fix.
+
+**Suggested next step:** explore FT.AGGREGATE's main-thread pipeline from scratch — how `loads_`,
+`return_attributes`, `record_indexes_by_*` and the stage expressions actually relate — rather than extending
+the assumptions above.
+
+---
 
 ## Outstanding
 

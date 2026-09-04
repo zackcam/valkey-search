@@ -312,16 +312,15 @@ TEST_F(ResponseGeneratorTest, ProcessNeighborsForReplyContentLimits) {
 namespace {
 // Builds a single-neighbor scenario, runs ProcessNeighborsForReply, and returns
 // the surviving neighbors. `mutated` toggles the db/sequence mismatch that
-// drives VerifyFilter's recompute walk. `build_local_responder_scorer` installs
-// a pre-built scorer on parameters.local_responder_, standing in for the CME
-// shard whose scorer the coordinator borrows.
+// drives VerifyFilter's recompute walk. `build_scorer` installs a pre-built
+// scorer on `parameters`, standing in for the one Search() builds on the
+// background thread under its reader lock.
 void RunSingleNeighborRecompute(
     ValkeyModuleCtx *fake_ctx, UnitTestSearchParameters &parameters,
     MockAttributeDataType &data_type, absl::string_view key, bool mutated,
     query::PredicateType leaf_type, float weight, float initial_neighbor_score,
     const std::optional<std::string> &vector_identifier,
-    std::vector<indexes::Neighbor> &neighbors,
-    bool build_local_responder_scorer = false) {
+    std::vector<indexes::Neighbor> &neighbors, bool build_scorer = false) {
   parameters.index_schema = CreateIndexSchema("index").value();
   parameters.filter_parse_results.filter_identifiers = {"id2"};
 
@@ -356,13 +355,11 @@ void RunSingleNeighborRecompute(
         return m;
       });
 
-  if (build_local_responder_scorer) {
-    parameters.local_responder_->recompute_scorer =
-        std::make_unique<query::SingleDocumentScorer>(
-            *parameters.index_schema,
-            parameters.filter_parse_results.root_predicate.get(),
-            indexes::scoring::GetScorer(
-                indexes::scoring::ScorerType::kBm25Std));
+  if (build_scorer) {
+    parameters.recompute_scorer = std::make_unique<query::SingleDocumentScorer>(
+        *parameters.index_schema,
+        parameters.filter_parse_results.root_predicate.get(),
+        indexes::scoring::GetScorer(indexes::scoring::ScorerType::kBm25Std));
   }
 
   ProcessNeighborsForReply(fake_ctx, data_type, neighbors, parameters,
@@ -393,10 +390,9 @@ TEST_F(ResponseGeneratorTest, NoRecomputeWhenNeighborNotMutated) {
   EXPECT_FLOAT_EQ(neighbors[0].score, 7.0f);
 }
 
-// In CME the coordinating operation never runs Search(), so it carries no
-// recompute_scorer of its own and borrows the local responder's. Without the
-// borrow a mutated neighbor would silently keep its stale score.
-TEST_F(ResponseGeneratorTest, RecomputeBorrowsLocalResponderScorer) {
+// A mutated neighbor is recomputed through the scorer Search() pre-built on the
+// owning SearchParameters.
+TEST_F(ResponseGeneratorTest, RecomputeUsesPreBuiltScorer) {
   ValkeyModuleCtx fake_ctx;
   EXPECT_CALL(*kMockValkeyModule, GetExpire(testing::_))
       .WillRepeatedly(testing::Return(VALKEYMODULE_NO_EXPIRE));
@@ -404,19 +400,16 @@ TEST_F(ResponseGeneratorTest, RecomputeBorrowsLocalResponderScorer) {
   UnitTestSearchParameters parameters;
   MockAttributeDataType data_type;
   std::vector<indexes::Neighbor> neighbors;
-  // Stands in for the fanout local responder: it holds the pre-built scorer,
-  // while `parameters` (the coordinator) holds none.
-  parameters.local_responder_ = std::make_unique<UnitTestSearchParameters>();
 
   RunSingleNeighborRecompute(&fake_ctx, parameters, data_type, "k1",
                              /*mutated=*/true, query::PredicateType::kNumeric,
                              /*weight=*/3.0f, /*initial_neighbor_score=*/7.0f,
                              /*vector_identifier=*/std::nullopt, neighbors,
-                             /*build_local_responder_scorer=*/true);
+                             /*build_scorer=*/true);
 
   ASSERT_EQ(neighbors.size(), 1);
-  // The borrowed scorer ran: a numeric leaf is a filter, not a ranker, so it
-  // recomputes to 0 — the point is that the stale carried 7.0 was replaced.
+  // The scorer ran: a numeric leaf is a filter, not a ranker, so it recomputes
+  // to 0 — the point is that the stale carried 7.0 was replaced.
   EXPECT_FLOAT_EQ(neighbors[0].score, 0.0f);
 }
 

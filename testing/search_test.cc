@@ -1937,8 +1937,8 @@ TEST_F(ScoreTextQueryTestBase, ScoreIsSafeAgainstCommitsOnTheSameWord) {
 }
 
 // The pre-build gate must stay equivalent to GetContentProcessing() !=
-// kNoContent for a plain search, so operations that do not override it keep
-// their existing behavior.
+// kNoContent. No subclass overrides it: every operation that fetches content on
+// the main thread does so with no_content == false.
 TEST(RecomputeScorerGateTest, DefaultsToContentFetchingQueries) {
   UnitTestSearchParameters params;
   params.no_content = false;

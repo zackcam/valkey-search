@@ -154,7 +154,7 @@ class PredicateEvaluator : public query::Evaluator {
 DEV_INTEGER_COUNTER(query, predicate_revalidation);
 // A mutated non-vector neighbor reached the recompute with no scorer. Expected
 // to stay 0: Search() pre-builds one for every operation that fetches content,
-// and the CME coordinator borrows the local responder's.
+// and neighbors resolved by another shard never reach VerifyFilter.
 DEV_INTEGER_COUNTER(query, recompute_scorer_missing);
 
 // Result of a main-thread content-fetch revalidation of a neighbor.
@@ -197,15 +197,11 @@ FilterVerification VerifyFilter(const query::SearchParameters &parameters,
       return {result.matches, std::nullopt};
     }
     // Always built on a background thread under the search's reader lock, so
-    // the corpus snapshot matches the state the carried scores came from. In
-    // CME the coordinator never runs Search(); it borrows the local
-    // responder's, which is the right snapshot since only locally-owned keys
-    // land here.
+    // the corpus snapshot matches the state the carried scores came from. Every
+    // operation reaching here ran Search() itself: neighbors resolved by
+    // another shard arrive with content and are skipped before this point.
     const query::SingleDocumentScorer *scorer =
         parameters.recompute_scorer.get();
-    if (scorer == nullptr && parameters.local_responder_ != nullptr) {
-      scorer = parameters.local_responder_->recompute_scorer.get();
-    }
     if (scorer == nullptr) {
       // Keep the carried score rather than dropping or zeroing the document.
       recompute_scorer_missing.Increment();

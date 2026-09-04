@@ -308,12 +308,13 @@ TEST_F(AggregateTest, EmptyApplyAndFilterExpressionsAreRejected) {
   }
 }
 
-// FT.AGGREGATE fetches content on the main thread even when LOAD resolves to no
-// record attributes (no_content). The base class gates on !no_content, so this
-// override is what keeps Search() pre-building the recompute scorer.
-TEST_F(AggregateTest, AlwaysFetchesContentOnMainThread) {
+// A no_content FT.AGGREGATE skips the main-thread fetch (see
+// ProcessNeighborsForProcessing), so it must not claim one here.
+TEST_F(AggregateTest, NoContentDoesNotFetchContentOnMainThread) {
   AggregateParameters params(0);
   params.no_content = true;
+  EXPECT_FALSE(params.WillFetchContentOnMainThread());
+  params.no_content = false;
   EXPECT_TRUE(params.WillFetchContentOnMainThread());
 }
 

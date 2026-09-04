@@ -242,11 +242,6 @@ class LocalResponderSearch : public query::SearchParameters {
     QueryCompleteImpl(std::move(self));
   }
 
-  // This shard's neighbors reach the coordinator without content, so the
-  // coordinator fetches it and borrows the scorer built here. Unconditional:
-  // this object cannot see whether the coordinator will fetch content.
-  bool WillFetchContentOnMainThread() const override { return true; }
-
  private:
   void QueryCompleteImpl(std::unique_ptr<SearchParameters> self) {
     if (search_result.status.ok()) {

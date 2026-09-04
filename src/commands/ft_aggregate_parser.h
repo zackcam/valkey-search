@@ -73,10 +73,6 @@ struct AggregateParameters : public expr::Expression::CompileContext,
   // LIMIT offset & count.
   bool RequiresCompleteResults() const override;
 
-  // FT.AGGREGATE sets no_content when LOAD resolves to no record attributes,
-  // but SendReply still fetches content on the main thread to evaluate the
-  // filter, so a recompute is always possible.
-  bool WillFetchContentOnMainThread() const override { return true; }
   //
   // Number of records required as output of the query phase.
   // If all records are required, then it will be

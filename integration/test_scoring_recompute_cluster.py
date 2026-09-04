@@ -1,18 +1,12 @@
 """Cluster-mode coverage for the main-thread score recompute path.
 
-Two shapes reach the recompute in CME and get their scorer differently:
+Only content-fetching queries reach the recompute, and each does so on the shard
+that ran Search() and pre-built the scorer. A no_content FT.AGGREGATE fetches
+nothing and must not reach it at all: the fetch would walk the per-key text index
+unlocked without the PerformKeyContentionCheck quiesce.
 
-  FT.SEARCH with content — the local responder resolves its own content, so its
-  neighbors reach the coordinator populated and the coordinator skips them. The
-  recompute runs on the responder, off the scorer it pre-built.
-
-  FT.AGGREGATE whose LOAD resolves to no record attributes — no_content
-  propagates to every responder, so nothing carries content and the coordinator
-  fetches it for the keys it owns. The coordinating AggregateParameters never ran
-  Search(), so it borrows the responder's scorer. Without the
-  WillFetchContentOnMainThread overrides neither object has one, and the mutated
-  document silently keeps its stale score. search_recompute_scorer_missing
-  counts that fall-through and must stay 0.
+search_recompute_scorer_missing counts a mutated non-vector neighbor that reached
+the recompute with no scorer and silently kept its stale score; it must stay 0.
 
 The index is numeric/tag deliberately: those queries resolve to
 kContentRequired, which skips PerformKeyContentionCheck, so revalidation runs
@@ -107,16 +101,34 @@ class TestScoringRecomputeCluster(ValkeySearchClusterTestCaseDebugMode):
         scores = [s for _, s in _pairs(res)]
         assert scores and all(math.isfinite(s) for s in scores)
 
-    def test_aggregate_no_content_borrows_local_responder_scorer(self):
+    def test_aggregate_no_content_skips_main_thread_fetch(self):
+        """LOAD __key alone resolves to no record attributes, so no_content is
+        set and no content is fetched. VerifyFilter is only reachable from
+        ProcessNeighborsForReply, so a flat search_predicate_revalidation proves
+        the fetch was skipped."""
         coordinator: Valkey = self.new_client_for_primary(0)
         key = self._load(coordinator)
         before = self._counter(coordinator, "search_predicate_revalidation")
 
-        # LOAD __key alone resolves to no record attributes, so no_content is set
-        # and nothing carries content back from any responder.
         res = self._run_with_mutation_in_flight(
             coordinator, key,
             "FT.AGGREGATE", IDX_NAME, "@t:{red}", "LOAD", "1", "__key",
+        )
+
+        assert self._counter(coordinator, "search_predicate_revalidation") == before
+        assert self._counter(coordinator, "search_recompute_scorer_missing") == 0
+        assert res
+
+    def test_aggregate_with_load_still_recomputes(self):
+        """A real LOAD clears no_content, so the fetch, revalidation and
+        recompute still run — as they do for FT.SEARCH."""
+        coordinator: Valkey = self.new_client_for_primary(0)
+        key = self._load(coordinator)
+        before = self._counter(coordinator, "search_predicate_revalidation")
+
+        res = self._run_with_mutation_in_flight(
+            coordinator, key,
+            "FT.AGGREGATE", IDX_NAME, "@t:{red}", "LOAD", "1", "@n",
         )
 
         assert self._counter(coordinator, "search_predicate_revalidation") > before
