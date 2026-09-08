@@ -149,7 +149,10 @@ static void DoPrefaceTestCase(FakeIndexInterface *fake_index, std::string test,
       EXPECT_FALSE(params.loadall_);
       EXPECT_EQ(params.loads_.size(), loads_test.value_->size());
       for (auto i = 0; i < loads_test.value_->size(); ++i) {
-        EXPECT_EQ(loads_test.value_->at(i), params.loads_[i]);
+        EXPECT_EQ(loads_test.value_->at(i), params.loads_[i].identifier);
+        // No AS clause in these cases (and the rename gate is off by default),
+        // so the output alias mirrors the identifier.
+        EXPECT_EQ(params.loads_[i].alias, params.loads_[i].identifier);
       }
     }
     EXPECT_EQ(params.inorder, inorder_test.value_);
@@ -343,6 +346,32 @@ TEST_F(AggregateTest, EmptyApplyAndFilterExpressionsAreRejected) {
       ValkeyModule_FreeString(nullptr, arg);
     }
   }
+}
+
+// A no_content FT.AGGREGATE skips the main-thread fetch (see
+// ProcessNeighborsForProcessing), so it must not claim one here.
+TEST_F(AggregateTest, AddScoresFlagParses) {
+  for (const bool given : {true, false}) {
+    auto argv = vmsdk::ToValkeyStringVector(given ? "ADDSCORES LOAD 1 @n1"
+                                                  : "LOAD 1 @n1");
+    vmsdk::ArgsIterator itr(argv.data(), argv.size());
+    AggregateParameters params(0);
+    params.parse_vars_.index_interface_ = &fake_index;
+    auto parser = CreateAggregateParser();
+    ASSERT_TRUE(parser.Parse(params, itr).ok());
+    EXPECT_EQ(params.addscores_, given);
+    for (auto arg : argv) {
+      ValkeyModule_FreeString(nullptr, arg);
+    }
+  }
+}
+
+TEST_F(AggregateTest, NoContentDoesNotFetchContentOnMainThread) {
+  AggregateParameters params(0);
+  params.no_content = true;
+  EXPECT_FALSE(params.WillFetchContentOnMainThread());
+  params.no_content = false;
+  EXPECT_TRUE(params.WillFetchContentOnMainThread());
 }
 
 TEST_F(AggregateTest, GetSerializationRange_NoStages) {
